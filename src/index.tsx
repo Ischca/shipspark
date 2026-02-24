@@ -23,6 +23,8 @@ import {
 } from "./lib/validation";
 import type { Bindings, HonoEnv } from "./types";
 import { GENERATED_STYLES } from "./_generated_styles";
+import { renderSvgToPng } from "./og/renderer";
+import { buildSiteOgSvg, buildProductOgSvg } from "./og/templates";
 
 type FeedItem = {
   productId: string;
@@ -42,6 +44,9 @@ type LayoutProps = {
   description?: string;
   canonical?: string;
   ogImage?: string;
+  ogType?: string;
+  jsonLd?: Record<string, unknown>;
+  twitterCreator?: string;
   children: unknown;
 };
 
@@ -173,7 +178,7 @@ const ICONS = {
 };
 
 const SITE_URL = "https://shipspark.net";
-const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#6d28d9"/><g transform="translate(4,4)"><path d="${ICONS.sparkles}" fill="#fff"/></g></svg>`;
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="${ICONS.sparkles}" fill="#22d3ee"/></svg>`;
 const FAVICON_DATA_URI = `data:image/svg+xml,${encodeURIComponent(FAVICON_SVG)}`;
 
 const toAbsoluteUrl = (requestUrl: string, path: string): string => {
@@ -207,126 +212,9 @@ const buildPostTemplate = (mode: "hashtag-only" | "short" | "full", slug: string
   return `name: Your Product\ntagline: One line value proposition\nurl: https://example.com\nrepo: https://github.com/owner/repo\n${tags}`;
 };
 
-// --- OG Image PNG generation ---
+// --- OG Image cache ---
 
-const ogPngCrc32 = (buf: Uint8Array): number => {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    c ^= buf[i];
-    for (let j = 0; j < 8; j++) c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
-  }
-  return (c ^ 0xffffffff) >>> 0;
-};
-
-const ogPngChunk = (type: string, data: Uint8Array): Uint8Array => {
-  const t = new Uint8Array([type.charCodeAt(0), type.charCodeAt(1), type.charCodeAt(2), type.charCodeAt(3)]);
-  const out = new Uint8Array(4 + 4 + data.length + 4);
-  const v = new DataView(out.buffer);
-  v.setUint32(0, data.length);
-  out.set(t, 4);
-  out.set(data, 8);
-  const forCrc = new Uint8Array(4 + data.length);
-  forCrc.set(t, 0);
-  forCrc.set(data, 4);
-  v.setUint32(8 + data.length, ogPngCrc32(forCrc));
-  return out;
-};
-
-let cachedOgPng: Uint8Array | null = null;
-
-const generateOgPng = async (): Promise<Uint8Array> => {
-  if (cachedOgPng) return cachedOgPng;
-
-  const W = 1200, H = 630;
-  const rowBytes = 1 + W * 3;
-  const raw = new Uint8Array(rowBytes * H);
-
-  // Gradient: dark navy-purple → brand purple
-  const c0 = [15, 10, 40];
-  const c1 = [109, 40, 217];
-
-  for (let y = 0; y < H; y++) {
-    const off = y * rowBytes;
-    raw[off] = 0; // filter: none
-    const t = y / (H - 1);
-    const r = Math.round(c0[0] + (c1[0] - c0[0]) * t);
-    const g = Math.round(c0[1] + (c1[1] - c0[1]) * t);
-    const b = Math.round(c0[2] + (c1[2] - c0[2]) * t);
-    raw[off + 1] = r;
-    raw[off + 2] = g;
-    raw[off + 3] = b;
-    let filled = 3;
-    while (filled < W * 3) {
-      const len = Math.min(filled, W * 3 - filled);
-      raw.copyWithin(off + 1 + filled, off + 1, off + 1 + len);
-      filled += len;
-    }
-  }
-
-  // Sparkle overlay (4-pointed star in center)
-  const cx = Math.round(W * 0.5), cy = Math.round(H * 0.5);
-  const armH = 100, armV = 80, armW = 4, diaR = 24;
-  const reach = Math.max(armH, armV);
-  for (let dy = -reach; dy <= reach; dy++) {
-    const py = cy + dy;
-    if (py < 0 || py >= H) continue;
-    for (let dx = -reach; dx <= reach; dx++) {
-      const px = cx + dx;
-      if (px < 0 || px >= W) continue;
-      const adx = Math.abs(dx), ady = Math.abs(dy);
-      let a = 0;
-      if (adx + ady < diaR) a = Math.max(a, 1 - (adx + ady) / diaR);
-      if (ady < armW && adx < armH) a = Math.max(a, (1 - adx / armH) * (1 - ady / armW));
-      if (adx < armW && ady < armV) a = Math.max(a, (1 - ady / armV) * (1 - adx / armW));
-      if (a > 0) {
-        a = a * a * 0.85;
-        const p = py * rowBytes + 1 + px * 3;
-        raw[p]     = Math.min(255, Math.round(raw[p]     * (1 - a) + 255 * a));
-        raw[p + 1] = Math.min(255, Math.round(raw[p + 1] * (1 - a) + 255 * a));
-        raw[p + 2] = Math.min(255, Math.round(raw[p + 2] * (1 - a) + 255 * a));
-      }
-    }
-  }
-
-  // Compress (PNG uses zlib = CompressionStream "deflate")
-  const cs = new CompressionStream("deflate");
-  const writer = cs.writable.getWriter();
-  writer.write(raw);
-  writer.close();
-  const parts: Uint8Array[] = [];
-  const reader = cs.readable.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-  }
-  const compLen = parts.reduce((s, p) => s + p.length, 0);
-  const compressed = new Uint8Array(compLen);
-  let pos = 0;
-  for (const p of parts) { compressed.set(p, pos); pos += p.length; }
-
-  // Assemble PNG
-  const ihdrData = new Uint8Array(13);
-  const ihdrView = new DataView(ihdrData.buffer);
-  ihdrView.setUint32(0, W);
-  ihdrView.setUint32(4, H);
-  ihdrData[8] = 8; ihdrData[9] = 2; // 8-bit RGB
-
-  const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
-  const ihdr = ogPngChunk("IHDR", ihdrData);
-  const idat = ogPngChunk("IDAT", compressed);
-  const iend = ogPngChunk("IEND", new Uint8Array(0));
-
-  const png = new Uint8Array(sig.length + ihdr.length + idat.length + iend.length);
-  let o = 0;
-  png.set(sig, o); o += sig.length;
-  png.set(ihdr, o); o += ihdr.length;
-  png.set(idat, o); o += idat.length;
-  png.set(iend, o);
-
-  cachedOgPng = png;
-  return png;
-};
+let cachedSiteOgPng: Uint8Array | null = null;
 
 const getLatestFeed = async (env: Bindings, limit: number): Promise<FeedItem[]> => {
   const db = getDb(env.DB);
@@ -987,7 +875,7 @@ const isApiIngestAuthorized = (c: Context<HonoEnv>): boolean => {
   return Boolean(internalToken && headerToken && internalToken === headerToken);
 };
 
-const Layout = ({ children, title, description, canonical, ogImage }: LayoutProps) => (
+const Layout = ({ children, title, description, canonical, ogImage, ogType, jsonLd, twitterCreator }: LayoutProps) => (
   <html lang="en">
     <head>
       <meta charSet="utf-8" />
@@ -996,17 +884,28 @@ const Layout = ({ children, title, description, canonical, ogImage }: LayoutProp
       <meta name="description" content={description ?? DEFAULT_DESCRIPTION} />
       {canonical ? <link rel="canonical" href={canonical} /> : null}
       <link rel="icon" href={FAVICON_DATA_URI} type="image/svg+xml" />
-      <meta name="theme-color" content="#6d28d9" />
-      <meta property="og:type" content="website" />
+      <meta name="theme-color" content="#0891b2" />
+      <meta property="og:type" content={ogType ?? "website"} />
       <meta property="og:site_name" content="ShipSpark" />
+      <meta property="og:locale" content="en_US" />
       <meta property="og:title" content={title ?? DEFAULT_TITLE} />
       <meta property="og:description" content={description ?? DEFAULT_DESCRIPTION} />
       {canonical ? <meta property="og:url" content={canonical} /> : null}
       <meta property="og:image" content={ogImage ?? `${SITE_URL}/og.png`} />
+      <meta property="og:image:width" content="1200" />
+      <meta property="og:image:height" content="630" />
+      <meta property="og:image:type" content="image/png" />
       <meta name="twitter:card" content="summary_large_image" />
       <meta name="twitter:title" content={title ?? DEFAULT_TITLE} />
       <meta name="twitter:description" content={description ?? DEFAULT_DESCRIPTION} />
       <meta name="twitter:image" content={ogImage ?? `${SITE_URL}/og.png`} />
+      {twitterCreator ? <meta name="twitter:creator" content={`@${twitterCreator}`} /> : null}
+      {jsonLd ? (
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+        />
+      ) : null}
       <style>{GENERATED_STYLES}{EXTRA_STYLES}</style>
     </head>
     <body class="min-h-screen">
@@ -1251,11 +1150,45 @@ const ProductEditPage = ({
 };
 
 app.get("/og.png", async (c) => {
-  const png = await generateOgPng();
-  return new Response(png.buffer as ArrayBuffer, {
+  if (!cachedSiteOgPng) {
+    cachedSiteOgPng = await renderSvgToPng(buildSiteOgSvg());
+  }
+  return new Response(cachedSiteOgPng.buffer as ArrayBuffer, {
     headers: {
       "content-type": "image/png",
       "cache-control": "public, max-age=604800, immutable",
+    },
+  });
+});
+
+app.get("/p/:handle/:slug/og.png", async (c) => {
+  const handle = normalizeHandle(c.req.param("handle"));
+  const slug = c.req.param("slug").toLowerCase();
+  const db = getDb(c.env.DB);
+
+  const product = await db
+    .select({ name: products.name, tagline: products.tagline })
+    .from(products)
+    .where(and(eq(products.xHandle, handle), eq(products.slug, slug)))
+    .limit(1);
+
+  if (product.length === 0) {
+    if (!cachedSiteOgPng) {
+      cachedSiteOgPng = await renderSvgToPng(buildSiteOgSvg());
+    }
+    return new Response(cachedSiteOgPng.buffer as ArrayBuffer, {
+      headers: { "content-type": "image/png", "cache-control": "public, max-age=60" },
+    });
+  }
+
+  const { name, tagline } = product[0];
+  const svg = buildProductOgSvg({ name, tagline, handle });
+  const png = await renderSvgToPng(svg);
+
+  return new Response(png.buffer as ArrayBuffer, {
+    headers: {
+      "content-type": "image/png",
+      "cache-control": "public, max-age=3600",
     },
   });
 });
@@ -1417,11 +1350,20 @@ app.get("/", async (c) => {
   const notice = c.req.query("notice") ?? undefined;
   const error = c.req.query("error") ?? undefined;
 
+  const homeJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    name: "ShipSpark",
+    url: SITE_URL,
+    description: DEFAULT_DESCRIPTION,
+  };
+
   return c.html(
     <Layout
       title={DEFAULT_TITLE}
       description={DEFAULT_DESCRIPTION}
       canonical={toAbsoluteUrl(c.req.url, "/")}
+      jsonLd={homeJsonLd}
     >
       <section class="hero-section relative rounded-xl border border-border bg-card p-6 md:p-10 shadow-lg mb-6">
         <h1 class="text-3xl md:text-5xl font-extrabold tracking-tighter leading-tight"
@@ -1539,11 +1481,20 @@ app.get("/tag/:tag", async (c) => {
     console.error("failed to fetch tag feed", error);
   }
 
+  const tagJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "CollectionPage",
+    name: `Launches tagged #${tag}`,
+    url: `${SITE_URL}/tag/${tag}`,
+    description: `New and hot launches for #${tag} on ShipSpark`,
+  };
+
   return c.html(
     <Layout
       title={`#${tag} | ShipSpark`}
-      description={`New and hot launches for #${tag}`}
+      description={`New and hot launches for #${tag} on ShipSpark — discover the latest products and tools`}
       canonical={toAbsoluteUrl(c.req.url, `/tag/${tag}`)}
+      jsonLd={tagJsonLd}
     >
       <section class="hero-section relative rounded-xl border border-border bg-card p-6 md:p-10 shadow-lg mb-6">
         <h1 class="text-3xl md:text-5xl font-extrabold tracking-tighter leading-tight"
@@ -2018,14 +1969,35 @@ app.get("/p/:handle/:slug", async (c) => {
     .orderBy(desc(launches.ingestedAt))
     .limit(20);
 
-  const description =
-    current.tagline ?? `SEO-friendly page for ${current.name} launch posts and X thread links.`;
+  const description = current.tagline
+    ? `${current.name} — ${current.tagline} | Launched on ShipSpark by @${handle}`
+    : `${current.name} by @${handle} — Discover launch posts and details on ShipSpark`;
+
+  const productJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    name: current.name,
+    description: current.tagline ?? `${current.name} on ShipSpark`,
+    url: `${SITE_URL}/p/${current.handle}/${current.slug}`,
+    applicationCategory: "WebApplication",
+    image: `${SITE_URL}/p/${current.handle}/${current.slug}/og.png`,
+    author: {
+      "@type": "Person",
+      name: `@${handle}`,
+      url: `https://x.com/${handle}`,
+    },
+    ...(current.homepageUrl ? { sameAs: current.homepageUrl } : {}),
+  };
 
   return c.html(
     <Layout
       title={`${current.name} | ShipSpark`}
       description={description}
       canonical={toAbsoluteUrl(c.req.url, `/p/${current.handle}/${current.slug}`)}
+      ogImage={`${SITE_URL}/p/${current.handle}/${current.slug}/og.png`}
+      ogType="product"
+      jsonLd={productJsonLd}
+      twitterCreator={handle}
     >
       <section class="hero-section relative rounded-xl border border-border bg-card p-6 md:p-10 shadow-lg mb-6">
         <h1 class="text-3xl md:text-5xl font-extrabold tracking-tighter leading-tight"
@@ -2082,18 +2054,31 @@ app.get("/p/:handle/:slug", async (c) => {
 
 app.get("/sitemap.xml", async (c) => {
   const db = getDb(c.env.DB);
-  const allProducts = await db.select({ handle: products.xHandle, slug: products.slug }).from(products).limit(5000);
+  const allProducts = await db
+    .select({
+      handle: products.xHandle,
+      slug: products.slug,
+      name: products.name,
+      updatedAt: products.updatedAt,
+    })
+    .from(products)
+    .orderBy(desc(products.updatedAt))
+    .limit(5000);
   const origin = new URL(c.req.url).origin;
+  const now = new Date().toISOString().slice(0, 10);
 
-  const urls = [
-    `${origin}/`,
-    `${origin}/tag/${normalizeTag(CAMPAIGN_HASHTAG)}`,
-    ...allProducts.map((item) => `${origin}/p/${item.handle}/${item.slug}`)
+  const staticUrls = [
+    `  <url>\n    <loc>${origin}/</loc>\n    <lastmod>${now}</lastmod>\n    <changefreq>hourly</changefreq>\n    <priority>1.0</priority>\n  </url>`,
+    `  <url>\n    <loc>${origin}/tag/${normalizeTag(CAMPAIGN_HASHTAG)}</loc>\n    <lastmod>${now}</lastmod>\n    <changefreq>hourly</changefreq>\n    <priority>0.6</priority>\n  </url>`,
   ];
 
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls
-    .map((url) => `  <url><loc>${url}</loc></url>`)
-    .join("\n")}\n</urlset>`;
+  const productUrls = allProducts.map((item) => {
+    const lastmod = new Date(item.updatedAt).toISOString().slice(0, 10);
+    const loc = `${origin}/p/${item.handle}/${item.slug}`;
+    return `  <url>\n    <loc>${loc}</loc>\n    <lastmod>${lastmod}</lastmod>\n    <changefreq>weekly</changefreq>\n    <priority>0.8</priority>\n  </url>`;
+  });
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${[...staticUrls, ...productUrls].join("\n")}\n</urlset>`;
 
   c.header("content-type", "application/xml; charset=utf-8");
   return c.body(xml);
