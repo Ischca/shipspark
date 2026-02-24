@@ -10,7 +10,9 @@
     "typecheck": "npm run build:css && tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "db:migrate:local": "wrangler d1 migrations apply shipspark --local",
-    "db:migrate:prod": "wrangler d1 migrations apply shipspark --remote"
+    "db:migrate:prod": "wrangler d1 migrations apply shipspark --remote",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@resvg/resvg-wasm": "^2.6.2",
@@ -23,6 +25,7 @@
     "drizzle-kit": "^0.31.6",
     "tailwindcss": "^4.2.0",
     "typescript": "^5.9.2",
+    "vitest": "^4.0.18",
     "wrangler": "^4.43.0"
   }
 }
