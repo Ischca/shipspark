@@ -17,3 +17,7 @@ binding = "DB"
 database_name = "shipspark"
 database_id = "fb35bdf9-7b58-4e90-b946-066c8df58e58"
 migrations_dir = "drizzle"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "shipspark-media"

@@ -129,9 +129,10 @@ export type ProductOgParams = {
   name: string;
   tagline: string | null;
   handle: string;
+  imageBase64?: string;
 };
 
-export const buildProductOgSvg = ({ name, tagline, handle }: ProductOgParams): string => {
+export const buildProductOgSvg = ({ name, tagline, handle, imageBase64 }: ProductOgParams): string => {
   const displayName = escapeXml(truncateText(name, 36));
   const displayTagline = tagline ? escapeXml(truncateText(tagline, 80)) : "";
   const displayHandle = escapeXml(`@${handle}`);
@@ -144,8 +145,29 @@ export const buildProductOgSvg = ({ name, tagline, handle }: ProductOgParams): s
   const barTop = nameY - 45;
   const barHeight = handleY - barTop + 5;
 
+  // Image layout: when image is present, show it on the right side
+  const imgSize = 280;
+  const imgX = 860;
+  const imgY = 180;
+  const imgClipId = "product-img-clip";
+
+  const imageSection = imageBase64
+    ? `
+  <!-- Product image (right side) -->
+  <defs>
+    <clipPath id="${imgClipId}">
+      <rect x="${imgX}" y="${imgY}" width="${imgSize}" height="${imgSize}" rx="20"/>
+    </clipPath>
+  </defs>
+  <rect x="${imgX}" y="${imgY}" width="${imgSize}" height="${imgSize}" rx="20"
+        fill="#22d3ee" fill-opacity="0.06" stroke="#22d3ee" stroke-opacity="0.15" stroke-width="1"/>
+  <image href="${imageBase64}"
+         x="${imgX}" y="${imgY}" width="${imgSize}" height="${imgSize}"
+         clip-path="url(#${imgClipId})" preserveAspectRatio="xMidYMid slice"/>`
+    : "";
+
   return `
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="630" viewBox="0 0 1200 630">
   ${SHARED_DEFS}
   <rect width="1200" height="630" fill="url(#bg)"/>
   <rect width="1200" height="630" fill="url(#glow)"/>
@@ -208,6 +230,8 @@ export const buildProductOgSvg = ({ name, tagline, handle }: ProductOgParams): s
         fill="#22d3ee">
     ${displayHandle}
   </text>
+
+  ${imageSection}
 
   <!-- ===== Bottom bar ===== -->
   <line x1="100" y1="545" x2="1100" y2="545"

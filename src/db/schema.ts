@@ -1,4 +1,4 @@
-import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const products = sqliteTable(
   "products",
@@ -11,6 +11,7 @@ export const products = sqliteTable(
     homepageUrl: text("homepage_url"),
     repoUrl: text("repo_url"),
     ownerHandle: text("owner_handle"),
+    imageKey: text("image_key"),
     createdAt: integer("created_at", { mode: "number" }).notNull(),
     updatedAt: integer("updated_at", { mode: "number" }).notNull()
   },
@@ -98,6 +99,26 @@ export const reports = sqliteTable("reports", {
   fingerprint: text("fingerprint"),
   createdAt: integer("created_at", { mode: "number" }).notNull()
 });
+
+export const launchMedia = sqliteTable(
+  "launch_media",
+  {
+    id: text("id").primaryKey(),
+    launchId: text("launch_id")
+      .notNull()
+      .references(() => launches.id, { onDelete: "cascade" }),
+    mediaKey: text("media_key").notNull(),
+    type: text("type").notNull(),
+    url: text("url").notNull(),
+    previewUrl: text("preview_url"),
+    width: integer("width"),
+    height: integer("height"),
+    createdAt: integer("created_at", { mode: "number" }).notNull()
+  },
+  (table) => ({
+    launchIdx: index("launch_media_launch_id").on(table.launchId)
+  })
+);
 
 export const ingestState = sqliteTable("ingest_state", {
   key: text("key").primaryKey(),

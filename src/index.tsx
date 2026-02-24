@@ -3,7 +3,7 @@ import { deleteCookie, getSignedCookie, setSignedCookie } from "hono/cookie";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { getDb } from "./db/client";
-import { claims, ingestState, launches, productMetrics, products, votes } from "./db/schema";
+import { claims, ingestState, launches, launchMedia, productMetrics, products, votes } from "./db/schema";
 import { buildVoteFingerprint } from "./lib/fingerprint";
 import {
   CAMPAIGN_HASHTAG,
@@ -50,6 +50,15 @@ type LayoutProps = {
   children: unknown;
 };
 
+type MediaItem = {
+  mediaKey: string;
+  type: string;
+  url: string;
+  previewUrl?: string;
+  width?: number;
+  height?: number;
+};
+
 type IngestPayload = {
   xUrl: string;
   rawText: string;
@@ -57,6 +66,7 @@ type IngestPayload = {
   authorName?: string;
   authorUrl?: string;
   isMakerPost?: boolean;
+  media?: MediaItem[];
 };
 
 type IngestResult =
@@ -97,8 +107,18 @@ type ProductEditPageProps = {
   tagline: string | null;
   homepageUrl: string | null;
   repoUrl: string | null;
+  imageUrl: string | null;
   notice?: string;
   error?: string;
+};
+
+type XMedia = {
+  media_key: string;
+  type: "photo" | "video" | "animated_gif";
+  url?: string;
+  preview_image_url?: string;
+  width?: number;
+  height?: number;
 };
 
 type XSearchResponse = {
@@ -106,6 +126,7 @@ type XSearchResponse = {
     id: string;
     text: string;
     author_id?: string;
+    attachments?: { media_keys?: string[] };
   }>;
   includes?: {
     users?: Array<{
@@ -113,6 +134,7 @@ type XSearchResponse = {
       username: string;
       name?: string;
     }>;
+    media?: XMedia[];
   };
   meta?: {
     result_count?: number;
@@ -424,8 +446,9 @@ const ingestLaunchPayload = async (env: Bindings, payload: IngestPayload): Promi
     };
   }
 
+  const launchId = crypto.randomUUID();
   await db.insert(launches).values({
-    id: crypto.randomUUID(),
+    id: launchId,
     productId,
     xUrl: payload.xUrl,
     xPostId: payload.xUrl.split("/").pop() ?? null,
@@ -436,6 +459,22 @@ const ingestLaunchPayload = async (env: Bindings, payload: IngestPayload): Promi
     isMakerPost: payload.isMakerPost ?? false,
     ingestedAt: now
   });
+
+  if (payload.media && payload.media.length > 0) {
+    for (const m of payload.media) {
+      await db.insert(launchMedia).values({
+        id: crypto.randomUUID(),
+        launchId,
+        mediaKey: m.mediaKey,
+        type: m.type,
+        url: m.url,
+        previewUrl: m.previewUrl ?? null,
+        width: m.width ?? null,
+        height: m.height ?? null,
+        createdAt: now,
+      });
+    }
+  }
 
   return {
     ok: true,
@@ -710,9 +749,10 @@ const runIngestionPolling = async (env: Bindings, cronExpr: string): Promise<voi
       const params = new URLSearchParams({
         query,
         max_results: "100",
-        expansions: "author_id",
-        "tweet.fields": "author_id,text,created_at",
-        "user.fields": "username,name"
+        expansions: "author_id,attachments.media_keys",
+        "tweet.fields": "author_id,text,created_at,attachments",
+        "user.fields": "username,name",
+        "media.fields": "media_key,type,url,preview_image_url,width,height"
       });
 
       if (cursor?.lastTweetId) {
@@ -762,6 +802,11 @@ const runIngestionPolling = async (env: Bindings, cronExpr: string): Promise<voi
         userById.set(user.id, { username: user.username, name: user.name });
       }
 
+      const mediaByKey = new Map<string, XMedia>();
+      for (const m of payload.includes?.media ?? []) {
+        mediaByKey.set(m.media_key, m);
+      }
+
       const tweets = payload.data ?? [];
       if (tweets.length === 0) {
         nextToken = undefined;
@@ -776,13 +821,26 @@ const runIngestionPolling = async (env: Bindings, cronExpr: string): Promise<voi
           continue;
         }
 
+        const tweetMedia = (tweet.attachments?.media_keys ?? [])
+          .map((mk) => mediaByKey.get(mk))
+          .filter((m): m is XMedia => m != null)
+          .map((m) => ({
+            mediaKey: m.media_key,
+            type: m.type,
+            url: m.url ?? m.preview_image_url ?? "",
+            previewUrl: m.preview_image_url,
+            width: m.width,
+            height: m.height,
+          }));
+
         const result = await ingestLaunchPayload(env, {
           xUrl: `https://x.com/${user.username}/status/${tweet.id}`,
           rawText: tweet.text,
           authorHandle: user.username,
           authorName: user.name,
           authorUrl: `https://x.com/${user.username}`,
-          isMakerPost: false
+          isMakerPost: false,
+          media: tweetMedia.length > 0 ? tweetMedia : undefined,
         });
 
         if (result.ok) {
@@ -1102,6 +1160,7 @@ const ProductEditPage = ({
   tagline,
   homepageUrl,
   repoUrl,
+  imageUrl,
   notice,
   error
 }: ProductEditPageProps) => {
@@ -1116,7 +1175,7 @@ const ProductEditPage = ({
       {notice ? <p class="notice-box mt-3">{notice}</p> : null}
       {error ? <p class="error-box mt-3">{error}</p> : null}
 
-      <form method="post" action={`/p/${handle}/${slug}/edit`}>
+      <form method="post" action={`/p/${handle}/${slug}/edit`} enctype="multipart/form-data">
         <div class="field-group grid gap-1.5 mt-3">
           <label htmlFor="edit-name" class="text-xs text-muted-foreground font-semibold uppercase tracking-wide">Name</label>
           <input id="edit-name" name="name" required defaultValue={name} />
@@ -1133,6 +1192,27 @@ const ProductEditPage = ({
           <label htmlFor="edit-repo" class="text-xs text-muted-foreground font-semibold uppercase tracking-wide">Repo URL (http/https)</label>
           <input id="edit-repo" name="repoUrl" defaultValue={repoUrl ?? ""} />
         </div>
+        <div class="field-group grid gap-1.5 mt-3">
+          <label class="text-xs text-muted-foreground font-semibold uppercase tracking-wide">Product Image</label>
+          {imageUrl ? (
+            <div class="mb-2">
+              <img src={imageUrl} alt="Current product image"
+                   class="rounded-md max-h-48 object-cover border border-border" />
+              <label class="mt-1.5 flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+                <input type="checkbox" name="removeImage" value="1" />
+                Remove current image
+              </label>
+            </div>
+          ) : null}
+          <div id="drop-zone"
+               class="rounded-md border-2 border-dashed border-border p-6 text-center text-sm text-muted-foreground cursor-pointer transition-colors"
+               style="min-height: 80px;">
+            <p class="m-0">Drag &amp; drop an image here, or click to select</p>
+            <p class="text-xs mt-1 m-0 opacity-60">PNG, JPG, WebP — Max 5 MB</p>
+            <input type="file" name="image" accept="image/png,image/jpeg,image/webp"
+                   class="hidden" id="image-input" />
+          </div>
+        </div>
         <div class="mt-5 flex flex-wrap gap-3">
           <button type="submit" class="btn-primary">
             Save
@@ -1145,9 +1225,26 @@ const ProductEditPage = ({
           </a>
         </div>
       </form>
+      <script src="/assets/image-upload.js" defer />
     </section>
   );
 };
+
+// --- Media serving ---
+const mediaUrl = (key: string | null): string | null =>
+  key ? `/media/${key}` : null;
+
+app.get("/media/:key{.+}", async (c) => {
+  const key = c.req.param("key");
+  const object = await c.env.MEDIA_BUCKET.get(key);
+  if (!object) return c.notFound();
+
+  const headers = new Headers();
+  headers.set("content-type", object.httpMetadata?.contentType ?? "application/octet-stream");
+  headers.set("cache-control", "public, max-age=31536000, immutable");
+  headers.set("etag", object.httpEtag);
+  return new Response(object.body, { headers });
+});
 
 app.get("/og.png", async (c) => {
   if (!cachedSiteOgPng) {
@@ -1167,7 +1264,7 @@ app.get("/p/:handle/:slug/og.png", async (c) => {
   const db = getDb(c.env.DB);
 
   const product = await db
-    .select({ name: products.name, tagline: products.tagline })
+    .select({ name: products.name, tagline: products.tagline, imageKey: products.imageKey })
     .from(products)
     .where(and(eq(products.xHandle, handle), eq(products.slug, slug)))
     .limit(1);
@@ -1181,8 +1278,27 @@ app.get("/p/:handle/:slug/og.png", async (c) => {
     });
   }
 
-  const { name, tagline } = product[0];
-  const svg = buildProductOgSvg({ name, tagline, handle });
+  const { name, tagline, imageKey } = product[0];
+
+  let imageBase64: string | undefined;
+  if (imageKey) {
+    try {
+      const obj = await c.env.MEDIA_BUCKET.get(imageKey);
+      if (obj) {
+        const buf = await obj.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        const b64 = btoa(binary);
+        const mime = obj.httpMetadata?.contentType ?? "image/png";
+        imageBase64 = `data:${mime};base64,${b64}`;
+      }
+    } catch {
+      // If R2 fetch fails, proceed without image
+    }
+  }
+
+  const svg = buildProductOgSvg({ name, tagline, handle, imageBase64 });
   const png = await renderSvgToPng(svg);
 
   return new Response(png.buffer as ArrayBuffer, {
@@ -1191,6 +1307,26 @@ app.get("/p/:handle/:slug/og.png", async (c) => {
       "cache-control": "public, max-age=3600",
     },
   });
+});
+
+app.get("/assets/image-upload.js", (c) => {
+  c.header("content-type", "application/javascript; charset=utf-8");
+  c.header("cache-control", "public, max-age=600");
+  return c.body(`(() => {
+  const zone = document.getElementById("drop-zone");
+  const input = document.getElementById("image-input");
+  if (!zone || !input) return;
+
+  zone.addEventListener("click", () => input.click());
+  zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.style.borderColor = "var(--color-primary)"; zone.style.background = "oklch(0.58 0.16 220 / 0.05)"; });
+  zone.addEventListener("dragleave", () => { zone.style.borderColor = ""; zone.style.background = ""; });
+  zone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    zone.style.borderColor = ""; zone.style.background = "";
+    if (e.dataTransfer.files.length > 0) { input.files = e.dataTransfer.files; zone.querySelector("p").textContent = e.dataTransfer.files[0].name; }
+  });
+  input.addEventListener("change", () => { if (input.files.length > 0) zone.querySelector("p").textContent = input.files[0].name; });
+})();`);
 });
 
 app.get("/assets/post-composer.js", (c) => {
@@ -1747,7 +1883,8 @@ app.get("/p/:handle/:slug/edit", async (c) => {
       name: products.name,
       tagline: products.tagline,
       homepageUrl: products.homepageUrl,
-      repoUrl: products.repoUrl
+      repoUrl: products.repoUrl,
+      imageKey: products.imageKey
     })
     .from(products)
     .where(and(eq(products.xHandle, handle), eq(products.slug, slug)))
@@ -1805,6 +1942,7 @@ app.get("/p/:handle/:slug/edit", async (c) => {
         tagline={current.tagline}
         homepageUrl={current.homepageUrl}
         repoUrl={current.repoUrl}
+        imageUrl={mediaUrl(current.imageKey)}
         notice={c.req.query("notice") ?? undefined}
         error={c.req.query("error") ?? undefined}
       />
@@ -1825,7 +1963,8 @@ app.post("/p/:handle/:slug/edit", async (c) => {
       name: products.name,
       tagline: products.tagline,
       homepageUrl: products.homepageUrl,
-      repoUrl: products.repoUrl
+      repoUrl: products.repoUrl,
+      imageKey: products.imageKey
     })
     .from(products)
     .where(and(eq(products.xHandle, handle), eq(products.slug, slug)))
@@ -1866,42 +2005,50 @@ app.post("/p/:handle/:slug/edit", async (c) => {
   const taglineRaw = sanitizeDisplayText(`${form.get("tagline") ?? ""}`);
   const homepageRaw = `${form.get("homepageUrl") ?? ""}`;
   const repoRaw = `${form.get("repoUrl") ?? ""}`;
+  const imageFile = form.get("image") as File | null;
+  const removeImage = form.get("removeImage") === "1";
 
   const homepageParsed = parseOptionalHttpUrl(homepageRaw);
   const repoParsed = parseOptionalHttpUrl(repoRaw);
 
-  if (!name) {
-    return c.html(
+  const editPageErr = (msg: string) =>
+    c.html(
       <Layout title={`Edit ${current.name} | ShipSpark`} canonical={toAbsoluteUrl(c.req.url, `/p/${handle}/${slug}/edit`)}>
         <ProductEditPage
           handle={handle}
           slug={slug}
-          name={name}
+          name={name || current.name}
           tagline={taglineRaw || null}
           homepageUrl={homepageRaw || null}
           repoUrl={repoRaw || null}
-          error="Name is required."
+          imageUrl={mediaUrl(current.imageKey)}
+          error={msg}
         />
       </Layout>,
       400
     );
+
+  if (!name) return editPageErr("Name is required.");
+  if (!homepageParsed.ok || !repoParsed.ok) return editPageErr("URLs must use http or https.");
+
+  const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+  const ALLOWED_TYPES = ["image/png", "image/jpeg", "image/webp"];
+  if (imageFile && imageFile.size > 0) {
+    if (imageFile.size > MAX_IMAGE_SIZE) return editPageErr("Image must be under 5 MB.");
+    if (!ALLOWED_TYPES.includes(imageFile.type)) return editPageErr("Image must be PNG, JPG, or WebP.");
   }
 
-  if (!homepageParsed.ok || !repoParsed.ok) {
-    return c.html(
-      <Layout title={`Edit ${current.name} | ShipSpark`} canonical={toAbsoluteUrl(c.req.url, `/p/${handle}/${slug}/edit`)}>
-        <ProductEditPage
-          handle={handle}
-          slug={slug}
-          name={name}
-          tagline={taglineRaw || null}
-          homepageUrl={homepageRaw || null}
-          repoUrl={repoRaw || null}
-          error="URLs must use http or https."
-        />
-      </Layout>,
-      400
-    );
+  let imageKey = current.imageKey;
+  if (removeImage && !(imageFile && imageFile.size > 0)) {
+    if (current.imageKey) await c.env.MEDIA_BUCKET.delete(current.imageKey);
+    imageKey = null;
+  } else if (imageFile && imageFile.size > 0) {
+    if (current.imageKey) await c.env.MEDIA_BUCKET.delete(current.imageKey);
+    const ext = imageFile.type === "image/jpeg" ? "jpg" : imageFile.type.split("/")[1];
+    imageKey = `products/${current.id}/image.${ext}`;
+    await c.env.MEDIA_BUCKET.put(imageKey, imageFile.stream(), {
+      httpMetadata: { contentType: imageFile.type },
+    });
   }
 
   await db
@@ -1911,6 +2058,7 @@ app.post("/p/:handle/:slug/edit", async (c) => {
       tagline: taglineRaw || null,
       homepageUrl: homepageParsed.value,
       repoUrl: repoParsed.value,
+      imageKey,
       updatedAt: NOW()
     })
     .where(eq(products.id, current.id));
@@ -1933,7 +2081,8 @@ app.get("/p/:handle/:slug", async (c) => {
       name: products.name,
       tagline: products.tagline,
       homepageUrl: products.homepageUrl,
-      repoUrl: products.repoUrl
+      repoUrl: products.repoUrl,
+      imageKey: products.imageKey
     })
     .from(products)
     .where(and(eq(products.xHandle, handle), eq(products.slug, slug)))
@@ -1968,6 +2117,20 @@ app.get("/p/:handle/:slug", async (c) => {
     .where(eq(launches.productId, current.id))
     .orderBy(desc(launches.ingestedAt))
     .limit(20);
+
+  const launchIds = launchRows.map((l) => l.id);
+  const mediaRows = launchIds.length > 0
+    ? await db
+        .select()
+        .from(launchMedia)
+        .where(sql`${launchMedia.launchId} IN (${sql.join(launchIds.map((id) => sql`${id}`), sql`, `)})`)
+    : [];
+  const mediaByLaunch = new Map<string, (typeof mediaRows)[number][]>();
+  for (const m of mediaRows) {
+    const arr = mediaByLaunch.get(m.launchId) ?? [];
+    arr.push(m);
+    mediaByLaunch.set(m.launchId, arr);
+  }
 
   const description = current.tagline
     ? `${current.name} — ${current.tagline} | Launched on ShipSpark by @${handle}`
@@ -2005,6 +2168,14 @@ app.get("/p/:handle/:slug", async (c) => {
           {current.name}
         </h1>
         <p class="mt-4 text-muted-foreground text-sm md:text-base font-light max-w-2xl leading-relaxed" style="white-space: pre-wrap;">{current.tagline ?? "No tagline yet."}</p>
+        {current.imageKey ? (
+          <img
+            src={mediaUrl(current.imageKey)!}
+            alt={current.name}
+            class="mt-6 rounded-lg border border-border shadow-sm max-h-64 w-full object-cover"
+            loading="lazy"
+          />
+        ) : null}
         <div class="mt-6 flex flex-wrap gap-3">
           <a class="btn-secondary" href={`https://x.com/${current.handle}`} target="_blank" rel="noreferrer">
             <Icon d={ICONS.externalLink} size={14} /> @{current.handle}
@@ -2041,6 +2212,24 @@ app.get("/p/:handle/:slug", async (c) => {
                 {launch.isMakerPost ? <span class="badge">Official</span> : null}
               </div>
               <p class="mt-2 text-sm text-muted-foreground leading-relaxed" style="white-space: pre-wrap;">{launch.rawText}</p>
+              {(() => {
+                const media = mediaByLaunch.get(launch.id) ?? [];
+                if (media.length === 0) return null;
+                return (
+                  <div class="mt-2 flex gap-2 overflow-x-auto">
+                    {media.map((m) =>
+                      m.type === "photo" ? (
+                        <img src={m.url} alt="" class="rounded-md max-h-40 object-cover border border-border" loading="lazy" />
+                      ) : (
+                        <a href={launch.xUrl} target="_blank" rel="noreferrer" class="relative rounded-md overflow-hidden border border-border block max-h-40">
+                          <img src={m.previewUrl ?? m.url} alt="" class="max-h-40 object-cover" loading="lazy" />
+                          <span class="absolute inset-0 flex items-center justify-center text-white text-2xl" style="background: rgba(0,0,0,0.4);">&#9654;</span>
+                        </a>
+                      )
+                    )}
+                  </div>
+                );
+              })()}
               <a class="btn-secondary mt-3 text-xs" href={launch.xUrl} target="_blank" rel="noreferrer">
                 <Icon d={ICONS.externalLink} size={12} /> View on X
               </a>
