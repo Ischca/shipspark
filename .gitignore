@@ -5,3 +5,4 @@ dist
 .DS_Store
 *.log
 src/_generated_styles.ts
+.claude/
